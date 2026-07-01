@@ -1,0 +1,31 @@
+name: S&P 500 Weekly S/R Screener
+
+on:
+  schedule:
+    # 23:00 UTC = 6:00 PM EST (7:00 PM EDT during summer). Mon-Fri.
+    # GitHub cron is always UTC and does not observe daylight saving.
+    - cron: "0 23 * * 1-5"
+  workflow_dispatch:        # allows manual "Run workflow" from the Actions tab
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run screener
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: python screener.py
