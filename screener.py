@@ -30,6 +30,7 @@ import os
 import smtplib
 import sys
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -73,21 +74,31 @@ class Hit:
     weeks_ago: int                  # 0 = current candle, 1 = last week, ...
     candle_date: str
     levels: list[str] = field(default_factory=list)  # which levels triggered
+    sector: str = "Unknown"         # GICS sector
 
 
 # --------------------------------------------------------------------------- #
 # S&P 500 universe
 # --------------------------------------------------------------------------- #
 
-def get_sp500_tickers() -> list[str]:
-    """Scrape the current S&P 500 constituents from Wikipedia."""
+def get_sp500_universe() -> dict[str, str]:
+    """
+    Scrape the current S&P 500 constituents from Wikipedia, returning a
+    mapping of {ticker: GICS sector}. yfinance uses '-' instead of '.'
+    (e.g. BRK.B -> BRK-B).
+    """
     resp = requests.get(WIKI_SP500, headers={"User-Agent": USER_AGENT}, timeout=30)
     resp.raise_for_status()
     tables = pd.read_html(io.StringIO(resp.text))
     df = tables[0]
-    symbols = df["Symbol"].astype(str).str.strip().tolist()
-    # yfinance uses '-' instead of '.' (e.g. BRK.B -> BRK-B)
-    return [s.replace(".", "-") for s in symbols if s]
+    universe: dict[str, str] = {}
+    for _, row in df.iterrows():
+        sym = str(row["Symbol"]).strip().replace(".", "-")
+        if not sym:
+            continue
+        sector = str(row.get("GICS Sector", "Unknown")).strip() or "Unknown"
+        universe[sym] = sector
+    return universe
 
 
 # --------------------------------------------------------------------------- #
@@ -354,40 +365,65 @@ def fetch_market_caps(tickers: list[str]) -> dict[str, float]:
 # Email
 # --------------------------------------------------------------------------- #
 
-def _rows_html(hits: list[Hit]) -> str:
-    if not hits:
-        return ('<tr><td colspan="4" style="padding:10px;color:#888;">'
-                'No matches today.</td></tr>')
-    rows = []
-    for h in sorted(hits, key=lambda x: (x.weeks_ago, x.ticker)):
-        when = "current week" if h.weeks_ago == 0 else f"{h.weeks_ago}w ago"
-        rows.append(
-            "<tr>"
-            f'<td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">{h.ticker}</td>'
-            f'<td style="padding:8px;border-bottom:1px solid #eee;">${h.price:,.2f}</td>'
-            f'<td style="padding:8px;border-bottom:1px solid #eee;">{", ".join(h.levels)}</td>'
-            f'<td style="padding:8px;border-bottom:1px solid #eee;">{when}<br>'
-            f'<span style="color:#999;font-size:12px;">{h.candle_date}</span></td>'
-            "</tr>"
-        )
-    return "\n".join(rows)
+GREEN = "#1a7f37"   # support
+RED = "#cf222e"     # resistance
+
+
+def _hit_row(h: Hit) -> str:
+    color = GREEN if h.kind == "support" else RED
+    signal = "Support" if h.kind == "support" else "Resistance"
+    when = "current week" if h.weeks_ago == 0 else f"{h.weeks_ago}w ago"
+    return (
+        "<tr>"
+        f'<td style="padding:8px;border-bottom:1px solid #eee;border-left:4px solid {color};'
+        f'font-weight:bold;color:{color};">{h.ticker}</td>'
+        f'<td style="padding:8px;border-bottom:1px solid #eee;color:{color};'
+        f'font-weight:bold;">{signal}</td>'
+        f'<td style="padding:8px;border-bottom:1px solid #eee;">${h.price:,.2f}</td>'
+        f'<td style="padding:8px;border-bottom:1px solid #eee;">{", ".join(h.levels)}</td>'
+        f'<td style="padding:8px;border-bottom:1px solid #eee;">{when}<br>'
+        f'<span style="color:#999;font-size:12px;">{h.candle_date}</span></td>'
+        "</tr>"
+    )
+
+
+def _sector_block(sector: str, hits: list[Hit]) -> str:
+    # support first (green), then resistance (red); each most-recent first
+    hits = sorted(hits, key=lambda h: (0 if h.kind == "support" else 1,
+                                       h.weeks_ago, h.ticker))
+    s_ct = sum(1 for h in hits if h.kind == "support")
+    r_ct = sum(1 for h in hits if h.kind == "resistance")
+    rows = "\n".join(_hit_row(h) for h in hits)
+    return f"""
+        <h2 style="margin-top:30px;margin-bottom:6px;border-bottom:2px solid #ddd;
+                   padding-bottom:4px;font-size:18px;">{sector}
+          <span style="font-size:13px;font-weight:normal;">
+            &nbsp;<span style="color:{GREEN};">{s_ct} support</span> &middot;
+            <span style="color:{RED};">{r_ct} resistance</span></span></h2>
+        <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;">
+          <tr style="background:#f4f4f4;color:#555;text-align:left;">
+            <th style="padding:8px;">Ticker</th>
+            <th style="padding:8px;">Signal</th>
+            <th style="padding:8px;">Last Close</th>
+            <th style="padding:8px;">Level(s)</th>
+            <th style="padding:8px;">Touched</th>
+          </tr>
+          {rows}
+        </table>"""
 
 
 def build_email_html(support: list[Hit], resistance: list[Hit], scanned: int) -> str:
     date_str = datetime.now(timezone.utc).astimezone().strftime("%A, %B %d, %Y")
 
-    def section(title, color, hits):
-        return f"""
-        <h2 style="color:{color};margin-top:28px;">{title} ({len(hits)})</h2>
-        <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;">
-          <tr style="background:{color};color:#fff;text-align:left;">
-            <th style="padding:8px;">Ticker</th>
-            <th style="padding:8px;">Last Close</th>
-            <th style="padding:8px;">Level(s)</th>
-            <th style="padding:8px;">Touched</th>
-          </tr>
-          {_rows_html(hits)}
-        </table>"""
+    by_sector: dict[str, list[Hit]] = defaultdict(list)
+    for h in support + resistance:
+        by_sector[h.sector or "Unknown"].append(h)
+
+    if by_sector:
+        blocks = "\n".join(_sector_block(sec, by_sector[sec])
+                           for sec in sorted(by_sector))
+    else:
+        blocks = '<p style="color:#888;margin-top:24px;">No matches today.</p>'
 
     return f"""
     <html><body style="font-family:Arial,sans-serif;color:#222;max-width:760px;margin:auto;">
@@ -396,8 +432,11 @@ def build_email_html(support: list[Hit], resistance: list[Hit], scanned: int) ->
          weekly candles &middot; AVWAP (2 anchors) + EMA 9/20 cloud &middot;
          {TOLERANCE * 100:.1f}% tolerance &middot; last {LOOKBACK_WEEKS} weeks &middot;
          price &gt; ${MIN_PRICE:g} &middot; mcap &gt; ${MIN_MARKET_CAP/1e9:g}B</p>
-      {section("Support", "#1a7f37", support)}
-      {section("Resistance", "#cf222e", resistance)}
+      <p style="margin-top:0;font-size:14px;">
+        <b style="color:{GREEN};">&#9632; {len(support)} support</b> &nbsp;&middot;&nbsp;
+        <b style="color:{RED};">&#9632; {len(resistance)} resistance</b>
+        &nbsp;&middot;&nbsp;<span style="color:#888;">grouped by GICS sector</span></p>
+      {blocks}
       <p style="color:#999;font-size:12px;margin-top:30px;">
         AVWAP support/resistance = weekly wick within {TOLERANCE*100:.1f}% of the AVWAP
         and close on the supporting/resisting side.
@@ -438,9 +477,11 @@ def send_email(html: str, support: list[Hit], resistance: list[Hit]) -> None:
 # --------------------------------------------------------------------------- #
 
 def main() -> int:
-    print("Fetching S&P 500 tickers...", flush=True)
-    tickers = get_sp500_tickers()
-    print(f"{len(tickers)} tickers.", flush=True)
+    print("Fetching S&P 500 universe...", flush=True)
+    universe = get_sp500_universe()   # {ticker: GICS sector}
+    tickers = list(universe)
+    print(f"{len(tickers)} tickers across {len(set(universe.values()))} sectors.",
+          flush=True)
 
     data = download_weekly(tickers)
     print(f"Got weekly data for {len(data)} tickers.", flush=True)
@@ -453,9 +494,12 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"  {t}: eval error {exc}", flush=True)
             continue
+        sector = universe.get(t, "Unknown")
         if s:
+            s.sector = sector
             support.append(s)
         if r:
+            r.sector = sector
             resistance.append(r)
 
     print(f"Support hits: {len(support)} | Resistance hits: {len(resistance)} "

@@ -58,8 +58,11 @@ The price filter is applied up front (from the weekly data). Market cap is fetch
 avoid pulling 500 quotes. If a stock's market cap can't be retrieved (transient data
 error), it is **kept** rather than dropped, so a valid signal isn't lost to an API hiccup.
 
-The email has **separate Support and Resistance sections**, each listing the
-ticker, last close, which level(s) triggered, and how recent the touch was.
+The email is **grouped by GICS sector**. Under each sector heading, matching stocks
+are listed with **support in green** and **resistance in red**, showing the ticker,
+signal, last close, which level(s) triggered, and how recent the touch was. Each
+sector header also shows its support/resistance counts, and the top of the email
+carries the overall totals.
 
 ## Setup
 
