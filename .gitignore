@@ -4,3 +4,5 @@ __pycache__/
 venv/
 .env
 .DS_Store
+screener_output.html
+sector_rs_output.csv

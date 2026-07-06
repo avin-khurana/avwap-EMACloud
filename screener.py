@@ -10,7 +10,7 @@ For each S&P 500 stock it builds WEEKLY candles and computes:
       - anchored at the first weekly candle of the PREVIOUS year
   * EMA 9 and EMA 20 (the "EMA cloud" is the zone between them)
 
-Detection (over the 3 most recent weekly candles = current + last 2):
+Detection (over the LOOKBACK_WEEKS most recent weekly candles):
   * SUPPORT    -> candle LOW touches within TOLERANCE of a level AND the
                   candle CLOSES above that level (bullish rejection).
   * RESISTANCE -> candle HIGH touches within TOLERANCE of a level AND the
@@ -18,6 +18,10 @@ Detection (over the 3 most recent weekly candles = current + last 2):
 
 Levels tested: AVWAP(current year), AVWAP(previous year), EMA9, EMA20.
 The EMA cloud counts if EITHER edge (EMA9 or EMA20) is touched.
+
+Each hit is also graded on FUNDAMENTAL QUALITY (wheel-strategy suitability):
+net margin, return on equity, debt/equity and dividend — stocks passing the
+gate are flagged "Strong" in the email so CSP/CC candidates stand out.
 
 Matches are emailed to the configured recipient with separate
 Support and Resistance sections.
@@ -58,6 +62,33 @@ WEEKLY_PERIOD = "3y"      # enough history to anchor at start of previous year
 BATCH_SIZE = 100          # tickers per yfinance download call
 RECIPIENT = "avin.khurana18@gmail.com"
 
+# Fundamental-quality gate (wheel suitability). A hit is "Strong" when it
+# fails at most one evaluable check and passes at least two. Checks whose
+# data is unavailable (e.g. debt/equity for banks) are excluded, not failed.
+QUALITY_MIN_MARGIN = 0.05   # net profit margin >= 5%
+QUALITY_MIN_ROE = 0.10      # return on equity >= 10%
+QUALITY_MAX_DE = 200.0      # debt/equity <= 200% (yfinance reports percent)
+
+# Relative strength (sector_rs_scanner methodology): % outperformance on
+# DAILY closes over 1-month and 3-month lookbacks, shown for sector-vs-SPY
+# (in the sector heading), stock-vs-sector and stock-vs-SPY (per row).
+RS_LOOKBACKS = {"1M": 21, "3M": 63}   # label -> trading days
+RS_PERIOD = "4mo"                     # daily history; covers 3M with buffer
+BENCHMARK = "SPY"
+SECTOR_ETF = {              # GICS sector -> SPDR sector ETF
+    "Information Technology": "XLK",
+    "Health Care": "XLV",
+    "Financials": "XLF",
+    "Consumer Discretionary": "XLY",
+    "Communication Services": "XLC",
+    "Industrials": "XLI",
+    "Consumer Staples": "XLP",
+    "Energy": "XLE",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+    "Materials": "XLB",
+}
+
 WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 USER_AGENT = "Mozilla/5.0 (screener; +https://github.com)"
 
@@ -75,6 +106,13 @@ class Hit:
     candle_date: str
     levels: list[str] = field(default_factory=list)  # which levels triggered
     sector: str = "Unknown"         # GICS sector
+    quality: str = "n/a"            # e.g. "3/4" (checks passed / evaluable)
+    quality_fails: list[str] = field(default_factory=list)  # failed checks
+    strong: bool = False            # passes the fundamental-quality gate
+    # relative strength in % points, keyed by lookback label ("1M", "3M")
+    rs_sector_spy: dict[str, float] = field(default_factory=dict)
+    rs_stock_sector: dict[str, float] = field(default_factory=dict)
+    rs_stock_spy: dict[str, float] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +159,48 @@ def anchored_vwap(df: pd.DataFrame, anchor_year: int) -> pd.Series | None:
     cum_v = seg["Volume"].cumsum().replace(0, pd.NA)
     vwap = cum_pv / cum_v
     return vwap.reindex(df.index)
+
+
+def pct_change_over(prices: pd.Series | None, n: int) -> float | None:
+    """% change over the last n trading days (sector_rs_scanner logic)."""
+    if prices is None:
+        return None
+    prices = prices.dropna()
+    if len(prices) <= n:
+        return None
+    return float((prices.iloc[-1] / prices.iloc[-n - 1] - 1) * 100)
+
+
+def download_daily_closes(tickers: list[str]) -> pd.DataFrame:
+    """Daily adjusted closes for the RS lookbacks, one column per ticker."""
+    data = yf.download(tickers, period=RS_PERIOD, interval="1d",
+                       auto_adjust=True, progress=False)["Close"]
+    if isinstance(data, pd.Series):          # single-ticker shape
+        data = data.to_frame(tickers[0])
+    return data
+
+
+def annotate_relative_strength(hits: list[Hit], closes: pd.DataFrame) -> None:
+    """
+    Fill each hit's three relative-strength legs, per RS_LOOKBACKS horizon
+    (% return difference on daily closes):
+    sector ETF vs SPY, stock vs sector ETF, stock vs SPY.
+    """
+    spy = closes.get(BENCHMARK)
+    for h in hits:
+        stock = closes.get(h.ticker)
+        etf = SECTOR_ETF.get(h.sector)
+        sec = closes.get(etf) if etf else None
+        for label, n in RS_LOOKBACKS.items():
+            spy_ret = pct_change_over(spy, n)
+            sec_ret = pct_change_over(sec, n)
+            stk_ret = pct_change_over(stock, n)
+            if sec_ret is not None and spy_ret is not None:
+                h.rs_sector_spy[label] = sec_ret - spy_ret
+            if stk_ret is not None and sec_ret is not None:
+                h.rs_stock_sector[label] = stk_ret - sec_ret
+            if stk_ret is not None and spy_ret is not None:
+                h.rs_stock_spy[label] = stk_ret - spy_ret
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -321,44 +401,92 @@ def download_weekly(tickers: list[str]) -> dict[str, pd.DataFrame]:
 
         for t in batch:
             try:
-                sub = data[t] if len(batch) > 1 else data
+                # group_by="ticker" yields MultiIndex columns even for a
+                # single-ticker batch, so always select the ticker level.
+                sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
                 sub = sub.dropna(how="all")
                 if not sub.empty:
                     out[t] = sub
-            except (KeyError, Exception):  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 continue
         time.sleep(1)  # be polite to Yahoo
     return out
 
 
-def _market_cap(ticker: str) -> float | None:
-    """Fetch a single ticker's market cap via yfinance fast_info."""
+@dataclass
+class Fundamentals:
+    mcap: float | None = None
+    quality: str = "n/a"                     # "passed/evaluable", e.g. "3/4"
+    fails: list[str] = field(default_factory=list)
+    strong: bool = False
+
+
+def _fundamentals(ticker: str) -> Fundamentals:
+    """
+    Fetch market cap + a fundamental-quality grade for one ticker.
+
+    Quality checks (pass / fail / n-a when the field is unavailable):
+      * net profit margin >= QUALITY_MIN_MARGIN
+      * return on equity  >= QUALITY_MIN_ROE   (n/a for negative-equity names)
+      * debt / equity     <= QUALITY_MAX_DE    (n/a for banks)
+      * pays a dividend                        (None = non-payer = fail)
+    "Strong" = at most one failed check and at least two passed.
+    """
     try:
-        mc = yf.Ticker(ticker).fast_info.market_cap
-        return float(mc) if mc else None
+        info = yf.Ticker(ticker).info or {}
     except Exception:  # noqa: BLE001
-        return None
+        return Fundamentals()
+
+    mcap = info.get("marketCap")
+    mcap = float(mcap) if mcap else None
+
+    checks: list[tuple[str, bool | None]] = []   # (fail label, pass/fail/None)
+    margin = info.get("profitMargins")
+    checks.append(("low margin",
+                   None if margin is None else margin >= QUALITY_MIN_MARGIN))
+    roe = info.get("returnOnEquity")
+    checks.append(("low ROE",
+                   None if roe is None else roe >= QUALITY_MIN_ROE))
+    de = info.get("debtToEquity")
+    checks.append(("high debt",
+                   None if de is None else de <= QUALITY_MAX_DE))
+    if margin is None and roe is None and de is None:
+        # No real fundamental data came back (bad/missing quote) — grade as
+        # n/a instead of failing the dividend check on absent data.
+        return Fundamentals(mcap=mcap)
+    div = info.get("dividendYield")
+    checks.append(("no dividend", bool(div and div > 0)))
+
+    evaluated = [(label, ok) for label, ok in checks if ok is not None]
+    passed = sum(1 for _, ok in evaluated if ok)
+    fails = [label for label, ok in evaluated if not ok]
+    if not evaluated:
+        return Fundamentals(mcap=mcap)
+    return Fundamentals(
+        mcap=mcap,
+        quality=f"{passed}/{len(evaluated)}",
+        fails=fails,
+        strong=len(fails) <= 1 and passed >= 2,
+    )
 
 
-def fetch_market_caps(tickers: list[str]) -> dict[str, float]:
+def fetch_fundamentals(tickers: list[str]) -> dict[str, Fundamentals]:
     """
-    Fetch market caps for the given tickers concurrently. Only tickers with a
-    successfully retrieved value are included in the result (fetch failures are
-    omitted, so the caller decides how to treat unknowns).
+    Fetch market cap + quality grade for the given tickers concurrently.
+    Every requested ticker gets an entry; fetch failures come back as a
+    default Fundamentals (mcap None, quality "n/a") so the caller can
+    fail-open on the market-cap filter.
     """
-    caps: dict[str, float] = {}
+    out: dict[str, Fundamentals] = {}
     if not tickers:
-        return caps
-    print(f"Fetching market caps for {len(tickers)} candidate tickers...",
+        return out
+    print(f"Fetching fundamentals for {len(tickers)} candidate tickers...",
           flush=True)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_market_cap, t): t for t in tickers}
+        futures = {pool.submit(_fundamentals, t): t for t in tickers}
         for fut in as_completed(futures):
-            t = futures[fut]
-            mc = fut.result()
-            if mc is not None:
-                caps[t] = mc
-    return caps
+            out[futures[fut]] = fut.result()
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -367,6 +495,47 @@ def fetch_market_caps(tickers: list[str]) -> dict[str, float]:
 
 GREEN = "#1a7f37"   # support
 RED = "#cf222e"     # resistance
+
+
+GOLD = "#9a6700"    # fundamentally strong badge
+
+
+def _quality_cell(h: Hit) -> str:
+    if h.quality == "n/a":
+        return '<span style="color:#999;">n/a</span>'
+    if h.strong:
+        detail = (f'<br><span style="color:#999;font-size:11px;">'
+                  f'{", ".join(h.quality_fails)}</span>' if h.quality_fails else "")
+        return (f'<span style="color:{GOLD};font-weight:bold;">'
+                f'&#9733; Strong {h.quality}</span>{detail}')
+    return (f'{h.quality}<br><span style="color:#999;font-size:11px;">'
+            f'{", ".join(h.quality_fails)}</span>')
+
+
+def _rs_values(vals: dict[str, float]) -> str:
+    """Render '+1.2% 1M · +4.5% 3M', each number colored by its own sign."""
+    parts = []
+    for label in RS_LOOKBACKS:
+        v = vals.get(label)
+        if v is None:
+            parts.append(f'<span style="color:#999;">{label} n/a</span>')
+        else:
+            color = GREEN if v >= 0 else RED
+            parts.append(f'<span style="color:{color};font-weight:bold;">'
+                         f'{v:+.1f}%</span> '
+                         f'<span style="color:#999;">{label}</span>')
+    return " &middot; ".join(parts)
+
+
+def _rs_cell(h: Hit) -> str:
+    # Sect/SPY lives in the sector heading (same for every row in the block);
+    # the row keeps the two stock-specific legs.
+    lines = [
+        f'<span style="color:#666;">Stk/Sect</span> {_rs_values(h.rs_stock_sector)}',
+        f'<span style="color:#666;">Stk/SPY</span> {_rs_values(h.rs_stock_spy)}',
+    ]
+    return ('<span style="font-size:12px;white-space:nowrap;">'
+            + "<br>".join(lines) + "</span>")
 
 
 def _hit_row(h: Hit) -> str:
@@ -381,6 +550,8 @@ def _hit_row(h: Hit) -> str:
         f'font-weight:bold;">{signal}</td>'
         f'<td style="padding:8px;border-bottom:1px solid #eee;">${h.price:,.2f}</td>'
         f'<td style="padding:8px;border-bottom:1px solid #eee;">{", ".join(h.levels)}</td>'
+        f'<td style="padding:8px;border-bottom:1px solid #eee;">{_quality_cell(h)}</td>'
+        f'<td style="padding:8px;border-bottom:1px solid #eee;">{_rs_cell(h)}</td>'
         f'<td style="padding:8px;border-bottom:1px solid #eee;">{when}<br>'
         f'<span style="color:#999;font-size:12px;">{h.candle_date}</span></td>'
         "</tr>"
@@ -388,15 +559,24 @@ def _hit_row(h: Hit) -> str:
 
 
 def _sector_block(sector: str, hits: list[Hit]) -> str:
-    # support first (green), then resistance (red); each most-recent first
+    # support first (green), then resistance (red); within each, fundamentally
+    # strong names first, then most-recent first
     hits = sorted(hits, key=lambda h: (0 if h.kind == "support" else 1,
-                                       h.weeks_ago, h.ticker))
+                                       not h.strong, h.weeks_ago, h.ticker))
     s_ct = sum(1 for h in hits if h.kind == "support")
     r_ct = sum(1 for h in hits if h.kind == "resistance")
     rows = "\n".join(_hit_row(h) for h in hits)
+    # sector-vs-SPY relative strength is per-sector, so it belongs up here
+    sect_rs = next((h.rs_sector_spy for h in hits if h.rs_sector_spy), None)
+    if sect_rs is None:
+        rs_badge = ""
+    else:
+        rs_badge = (f' <span style="font-size:13px;font-weight:normal;'
+                    f'color:#666;">vs SPY</span> <span style="font-size:14px;'
+                    f'font-weight:normal;">{_rs_values(sect_rs)}</span>')
     return f"""
         <h2 style="margin-top:30px;margin-bottom:6px;border-bottom:2px solid #ddd;
-                   padding-bottom:4px;font-size:18px;">{sector}
+                   padding-bottom:4px;font-size:18px;">{sector}{rs_badge}
           <span style="font-size:13px;font-weight:normal;">
             &nbsp;<span style="color:{GREEN};">{s_ct} support</span> &middot;
             <span style="color:{RED};">{r_ct} resistance</span></span></h2>
@@ -406,6 +586,8 @@ def _sector_block(sector: str, hits: list[Hit]) -> str:
             <th style="padding:8px;">Signal</th>
             <th style="padding:8px;">Last Close</th>
             <th style="padding:8px;">Level(s)</th>
+            <th style="padding:8px;">Quality</th>
+            <th style="padding:8px;">Rel Strength</th>
             <th style="padding:8px;">Touched</th>
           </tr>
           {rows}
@@ -414,6 +596,7 @@ def _sector_block(sector: str, hits: list[Hit]) -> str:
 
 def build_email_html(support: list[Hit], resistance: list[Hit], scanned: int) -> str:
     date_str = datetime.now(timezone.utc).astimezone().strftime("%A, %B %d, %Y")
+    strong_ct = sum(1 for h in support + resistance if h.strong)
 
     by_sector: dict[str, list[Hit]] = defaultdict(list)
     for h in support + resistance:
@@ -434,7 +617,8 @@ def build_email_html(support: list[Hit], resistance: list[Hit], scanned: int) ->
          price &gt; ${MIN_PRICE:g} &middot; mcap &gt; ${MIN_MARKET_CAP/1e9:g}B</p>
       <p style="margin-top:0;font-size:14px;">
         <b style="color:{GREEN};">&#9632; {len(support)} support</b> &nbsp;&middot;&nbsp;
-        <b style="color:{RED};">&#9632; {len(resistance)} resistance</b>
+        <b style="color:{RED};">&#9632; {len(resistance)} resistance</b> &nbsp;&middot;&nbsp;
+        <b style="color:{GOLD};">&#9733; {strong_ct} fundamentally strong</b>
         &nbsp;&middot;&nbsp;<span style="color:#888;">grouped by GICS sector</span></p>
       {blocks}
       <p style="color:#999;font-size:12px;margin-top:30px;">
@@ -445,16 +629,39 @@ def build_email_html(support: list[Hit], resistance: list[Hit], scanned: int) ->
         Structure filter: cloud signals require both AVWAPs on the far side of the 9 EMA;
         AVWAP signals require the 9 EMA on the far side of both AVWAPs.
         Checked over the last {LOOKBACK_WEEKS} weekly candles.
+        Quality = fundamental checks passed / evaluable: net margin &ge; {QUALITY_MIN_MARGIN:.0%},
+        ROE &ge; {QUALITY_MIN_ROE:.0%}, debt/equity &le; {QUALITY_MAX_DE:.0f}%, pays a dividend
+        (checks with unavailable data, e.g. debt/equity for banks, are excluded).
+        &#9733; Strong = at most one failed check and two or more passed &mdash; wheel-suitable
+        (CSP at green support levels, CC at red resistance levels).
+        Rel Strength = % return difference on daily closes over 1-month (21
+        trading days) and 3-month (63 trading days) lookbacks.
+        The sector heading shows the sector's GICS ETF vs SPY; each row shows
+        Stk/Sect = the stock vs its sector ETF and Stk/SPY = the stock vs SPY.
+        All legs green = leading stock in a leading sector (tailwind for CSPs);
+        all red = laggard in a lagging sector. 1M green with 3M red flags an
+        early turnaround; 1M red with 3M green flags fading momentum.
         Automated screener &middot; not financial advice.</p>
     </body></html>"""
+
+
+OUTPUT_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "screener_output.html")
+
+
+def save_html(html: str) -> None:
+    """Write the report next to the script so local runs can open it."""
+    with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Report saved to {OUTPUT_HTML}", flush=True)
 
 
 def send_email(html: str, support: list[Hit], resistance: list[Hit]) -> None:
     user = os.environ.get("EMAIL_USER")
     password = os.environ.get("EMAIL_APP_PASSWORD")
     if not user or not password:
-        print("EMAIL_USER / EMAIL_APP_PASSWORD not set - skipping send.", flush=True)
-        print(html)
+        print("EMAIL_USER / EMAIL_APP_PASSWORD not set - skipping send "
+              f"(open {OUTPUT_HTML} to view the report).", flush=True)
         return
 
     msg = MIMEMultipart("alternative")
@@ -505,28 +712,52 @@ def main() -> int:
     print(f"Support hits: {len(support)} | Resistance hits: {len(resistance)} "
           f"(price >= ${MIN_PRICE:g})", flush=True)
 
-    # Market-cap filter: only fetch caps for stocks that actually produced a hit.
+    # Fundamentals (market cap + quality grade): only fetched for stocks that
+    # actually produced a hit.
     hit_tickers = {h.ticker for h in support} | {h.ticker for h in resistance}
-    caps = fetch_market_caps(sorted(hit_tickers))
+    funds = fetch_fundamentals(sorted(hit_tickers))
 
     def passes_mcap(h: Hit) -> bool:
         # Fail-open: keep a stock if its market cap could not be retrieved,
         # rather than dropping a valid signal on a transient data error.
-        mc = caps.get(h.ticker)
-        return mc is None or mc >= MIN_MARKET_CAP
+        f = funds.get(h.ticker)
+        return f is None or f.mcap is None or f.mcap >= MIN_MARKET_CAP
 
     dropped = sum(1 for h in support + resistance
-                  if caps.get(h.ticker) is not None
-                  and caps[h.ticker] < MIN_MARKET_CAP)
-    unknown = len(hit_tickers) - len(caps)
+                  if funds.get(h.ticker) is not None
+                  and funds[h.ticker].mcap is not None
+                  and funds[h.ticker].mcap < MIN_MARKET_CAP)
+    unknown = sum(1 for t in hit_tickers
+                  if funds.get(t) is None or funds[t].mcap is None)
     support = [h for h in support if passes_mcap(h)]
     resistance = [h for h in resistance if passes_mcap(h)]
+
+    for h in support + resistance:
+        f = funds.get(h.ticker)
+        if f is not None:
+            h.quality, h.quality_fails, h.strong = f.quality, f.fails, f.strong
+
+    # Relative strength vs SPY and sector ETFs (1M / 3M on daily closes).
+    remaining = {h.ticker for h in support} | {h.ticker for h in resistance}
+    rs_tickers = sorted({BENCHMARK, *SECTOR_ETF.values(), *remaining})
+    print(f"Downloading daily closes for relative strength "
+          f"({len(rs_tickers)} tickers)...", flush=True)
+    try:
+        closes = download_daily_closes(rs_tickers)
+        annotate_relative_strength(support + resistance, closes)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  relative-strength download failed: {exc} (legs left n/a)",
+              flush=True)
+
+    strong_ct = sum(1 for h in support + resistance if h.strong)
     print(f"Market-cap filter (>= ${MIN_MARKET_CAP/1e9:g}B): dropped {dropped}, "
           f"{unknown} unknown (kept). "
-          f"Final: {len(support)} support | {len(resistance)} resistance.",
+          f"Final: {len(support)} support | {len(resistance)} resistance "
+          f"| {strong_ct} fundamentally strong.",
           flush=True)
 
     html = build_email_html(support, resistance, len(data))
+    save_html(html)
     send_email(html, support, resistance)
     return 0
 
