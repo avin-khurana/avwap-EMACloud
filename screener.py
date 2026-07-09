@@ -19,6 +19,13 @@ Detection (over the LOOKBACK_WEEKS most recent weekly candles):
 Levels tested: AVWAP(current year), AVWAP(previous year), EMA9, EMA20.
 The EMA cloud counts if EITHER edge (EMA9 or EMA20) is touched.
 
+CONFLUENCE: a stock that shows the SAME signal (support or resistance) on
+BOTH the EMA cloud AND at least one AVWAP within the lookback window is
+reported in a separate section at the end. The trend-structure filter is
+NOT applied here — it requires the AVWAPs and the cloud on opposite sides
+of price and would make co-occurrence impossible; an AVWAP sitting inside
+or near the cloud is precisely what forms the confluence zone.
+
 Each hit is also graded on FUNDAMENTAL QUALITY (wheel-strategy suitability):
 net margin, return on equity, debt/equity and dividend — stocks passing the
 gate are flagged "Strong" in the email so CSP/CC candidates stand out.
@@ -52,7 +59,7 @@ import yfinance as yf
 TOLERANCE = 0.01          # 1.0% band for an AVWAP "touch"
 LOOKBACK_WEEKS = 2        # current weekly candle + last 1
 MIN_PRICE = 50.0          # only stocks trading above this (last close)
-MIN_MARKET_CAP = 10_000_000_000   # only stocks with market cap above $10B
+MIN_MARKET_CAP = 100_000_000_000  # only stocks with market cap above $100B
 REJECT_FRACTION = 2 / 3   # EMA-cloud rejection: close must be in this
                           # fraction (upper third for support / lower third
                           # for resistance) of the candle's range
@@ -270,20 +277,26 @@ def _cloud_resistance(low, high, close, cloud_lo, cloud_hi) -> bool:
     return entered_cloud and held_cloud and closed_below and rejection
 
 
-def evaluate(ticker: str, df: pd.DataFrame) -> tuple[Hit | None, Hit | None]:
+def evaluate(
+    ticker: str, df: pd.DataFrame,
+) -> tuple[Hit | None, Hit | None, Hit | None, Hit | None]:
     """
     Inspect the last LOOKBACK_WEEKS weekly candles of one stock and return
-    (support_hit, resistance_hit); either may be None.
+    (support_hit, resistance_hit, confluence_support, confluence_resistance);
+    any may be None.
 
     AVWAP levels use the 1% proximity rule; the EMA cloud uses strict rejection.
+    Confluence hits use the same raw touch/rejection rules but WITHOUT the
+    trend-structure filter (which forbids cloud+AVWAP co-occurrence) and
+    require both level families to fire on the same side.
     """
     df = add_indicators(df)
     if len(df) < EMA_SLOW:
-        return None, None
+        return None, None, None, None
 
     last_close = float(df["Close"].iloc[-1])
     if pd.isna(last_close) or last_close < MIN_PRICE:
-        return None, None
+        return None, None, None, None
 
     recent = df.tail(LOOKBACK_WEEKS)
 
@@ -317,6 +330,9 @@ def evaluate(ticker: str, df: pd.DataFrame) -> tuple[Hit | None, Hit | None]:
 
     support_levels: dict[str, tuple[int, str]] = {}    # label -> (weeks_ago, date)
     resistance_levels: dict[str, tuple[int, str]] = {}
+    # raw (structure-filter-free) touches, used only for confluence detection
+    conf_support_levels: dict[str, tuple[int, str]] = {}
+    conf_resistance_levels: dict[str, tuple[int, str]] = {}
 
     def record(store, label, weeks_ago, cdate):
         prev = store.get(label)
@@ -335,23 +351,43 @@ def evaluate(ticker: str, df: pd.DataFrame) -> tuple[Hit | None, Hit | None]:
             if pd.isna(level):
                 continue
             level = float(level)
-            if avwap_sup_ok and _avwap_support(low, close, level):
-                record(support_levels, label, weeks_ago, cdate)
-            if avwap_res_ok and _avwap_resistance(high, close, level):
-                record(resistance_levels, label, weeks_ago, cdate)
+            if _avwap_support(low, close, level):
+                record(conf_support_levels, label, weeks_ago, cdate)
+                if avwap_sup_ok:
+                    record(support_levels, label, weeks_ago, cdate)
+            if _avwap_resistance(high, close, level):
+                record(conf_resistance_levels, label, weeks_ago, cdate)
+                if avwap_res_ok:
+                    record(resistance_levels, label, weeks_ago, cdate)
 
         # --- EMA cloud (zone between EMA9 and EMA20): strict rejection + confirm ---
         ema_f, ema_s = row["EMA_FAST"], row["EMA_SLOW"]
         if not (pd.isna(ema_f) or pd.isna(ema_s)):
             cloud_lo, cloud_hi = sorted((float(ema_f), float(ema_s)))
-            if cloud_sup_ok and _cloud_support(low, high, close, cloud_lo, cloud_hi):
-                record(support_levels, "EMA cloud", weeks_ago, cdate)
-            if cloud_res_ok and _cloud_resistance(low, high, close, cloud_lo, cloud_hi):
-                record(resistance_levels, "EMA cloud", weeks_ago, cdate)
+            if _cloud_support(low, high, close, cloud_lo, cloud_hi):
+                record(conf_support_levels, "EMA cloud", weeks_ago, cdate)
+                if cloud_sup_ok:
+                    record(support_levels, "EMA cloud", weeks_ago, cdate)
+            if _cloud_resistance(low, high, close, cloud_lo, cloud_hi):
+                record(conf_resistance_levels, "EMA cloud", weeks_ago, cdate)
+                if cloud_res_ok:
+                    record(resistance_levels, "EMA cloud", weeks_ago, cdate)
 
     support_hit = _build_hit(ticker, "support", last_close, support_levels)
     resistance_hit = _build_hit(ticker, "resistance", last_close, resistance_levels)
-    return support_hit, resistance_hit
+    conf_support_hit = (_build_hit(ticker, "support", last_close, conf_support_levels)
+                        if _is_confluence(conf_support_levels) else None)
+    conf_resistance_hit = (_build_hit(ticker, "resistance", last_close,
+                                      conf_resistance_levels)
+                           if _is_confluence(conf_resistance_levels) else None)
+    return support_hit, resistance_hit, conf_support_hit, conf_resistance_hit
+
+
+def _is_confluence(levels_map: dict) -> bool:
+    """Both level families fired: the EMA cloud AND at least one AVWAP."""
+    has_cloud = any(l.startswith("EMA cloud") for l in levels_map)
+    has_avwap = any(l.startswith("AVWAP") for l in levels_map)
+    return has_cloud and has_avwap
 
 
 def _build_hit(ticker, kind, price, levels_map) -> Hit | None:
@@ -498,6 +534,7 @@ RED = "#cf222e"     # resistance
 
 
 GOLD = "#9a6700"    # fundamentally strong badge
+PURPLE = "#8250df"  # confluence section
 
 
 def _quality_cell(h: Hit) -> str:
@@ -594,7 +631,45 @@ def _sector_block(sector: str, hits: list[Hit]) -> str:
         </table>"""
 
 
-def build_email_html(support: list[Hit], resistance: list[Hit], scanned: int) -> str:
+def _confluence_section(confluence: list[Hit]) -> str:
+    """
+    Trailing section listing stocks whose support/resistance fired on BOTH
+    the EMA cloud and an AVWAP (raw rules, no structure filter).
+    """
+    heading = (f'<h2 style="margin-top:36px;margin-bottom:6px;'
+               f'border-bottom:2px solid {PURPLE};padding-bottom:4px;'
+               f'font-size:18px;color:{PURPLE};">&#9889; Confluence '
+               f'<span style="font-size:13px;font-weight:normal;color:#666;">'
+               f'EMA cloud + AVWAP on the same side</span></h2>')
+    if not confluence:
+        return (heading
+                + '<p style="color:#888;margin-top:8px;">No confluence setups today.</p>')
+    hits = sorted(confluence, key=lambda h: (0 if h.kind == "support" else 1,
+                                             not h.strong, h.weeks_ago, h.ticker))
+    s_ct = sum(1 for h in hits if h.kind == "support")
+    r_ct = sum(1 for h in hits if h.kind == "resistance")
+    rows = "\n".join(_hit_row(h) for h in hits)
+    return f"""
+        {heading}
+        <p style="margin:4px 0 8px;font-size:13px;">
+          <span style="color:{GREEN};">{s_ct} support</span> &middot;
+          <span style="color:{RED};">{r_ct} resistance</span></p>
+        <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;">
+          <tr style="background:#f4f4f4;color:#555;text-align:left;">
+            <th style="padding:8px;">Ticker</th>
+            <th style="padding:8px;">Signal</th>
+            <th style="padding:8px;">Last Close</th>
+            <th style="padding:8px;">Level(s)</th>
+            <th style="padding:8px;">Quality</th>
+            <th style="padding:8px;">Rel Strength</th>
+            <th style="padding:8px;">Touched</th>
+          </tr>
+          {rows}
+        </table>"""
+
+
+def build_email_html(support: list[Hit], resistance: list[Hit],
+                     confluence: list[Hit], scanned: int) -> str:
     date_str = datetime.now(timezone.utc).astimezone().strftime("%A, %B %d, %Y")
     strong_ct = sum(1 for h in support + resistance if h.strong)
 
@@ -618,9 +693,11 @@ def build_email_html(support: list[Hit], resistance: list[Hit], scanned: int) ->
       <p style="margin-top:0;font-size:14px;">
         <b style="color:{GREEN};">&#9632; {len(support)} support</b> &nbsp;&middot;&nbsp;
         <b style="color:{RED};">&#9632; {len(resistance)} resistance</b> &nbsp;&middot;&nbsp;
-        <b style="color:{GOLD};">&#9733; {strong_ct} fundamentally strong</b>
+        <b style="color:{GOLD};">&#9733; {strong_ct} fundamentally strong</b> &nbsp;&middot;&nbsp;
+        <b style="color:{PURPLE};">&#9889; {len(confluence)} confluence</b>
         &nbsp;&middot;&nbsp;<span style="color:#888;">grouped by GICS sector</span></p>
       {blocks}
+      {_confluence_section(confluence)}
       <p style="color:#999;font-size:12px;margin-top:30px;">
         AVWAP support/resistance = weekly wick within {TOLERANCE*100:.1f}% of the AVWAP
         and close on the supporting/resisting side.
@@ -629,6 +706,9 @@ def build_email_html(support: list[Hit], resistance: list[Hit], scanned: int) ->
         Structure filter: cloud signals require both AVWAPs on the far side of the 9 EMA;
         AVWAP signals require the 9 EMA on the far side of both AVWAPs.
         Checked over the last {LOOKBACK_WEEKS} weekly candles.
+        &#9889; Confluence = the same signal fired on BOTH the EMA cloud and at least one
+        AVWAP within the lookback (raw touch/rejection rules, structure filter not
+        applied &mdash; an AVWAP sitting in or near the cloud is what forms the zone).
         Quality = fundamental checks passed / evaluable: net margin &ge; {QUALITY_MIN_MARGIN:.0%},
         ROE &ge; {QUALITY_MIN_ROE:.0%}, debt/equity &le; {QUALITY_MAX_DE:.0f}%, pays a dividend
         (checks with unavailable data, e.g. debt/equity for banks, are excluded).
@@ -656,7 +736,8 @@ def save_html(html: str) -> None:
     print(f"Report saved to {OUTPUT_HTML}", flush=True)
 
 
-def send_email(html: str, support: list[Hit], resistance: list[Hit]) -> None:
+def send_email(html: str, support: list[Hit], resistance: list[Hit],
+               confluence: list[Hit]) -> None:
     user = os.environ.get("EMAIL_USER")
     password = os.environ.get("EMAIL_APP_PASSWORD")
     if not user or not password:
@@ -667,7 +748,8 @@ def send_email(html: str, support: list[Hit], resistance: list[Hit]) -> None:
     msg = MIMEMultipart("alternative")
     today = datetime.now(timezone.utc).astimezone().strftime("%b %d")
     msg["Subject"] = (f"S&P500 Weekly S/R - {today}: "
-                      f"{len(support)} support, {len(resistance)} resistance")
+                      f"{len(support)} support, {len(resistance)} resistance, "
+                      f"{len(confluence)} confluence")
     msg["From"] = user
     msg["To"] = RECIPIENT
     msg.attach(MIMEText(html, "html"))
@@ -695,26 +777,27 @@ def main() -> int:
 
     support: list[Hit] = []
     resistance: list[Hit] = []
+    confluence: list[Hit] = []
     for t, df in data.items():
         try:
-            s, r = evaluate(t, df)
+            s, r, cs, cr = evaluate(t, df)
         except Exception as exc:  # noqa: BLE001
             print(f"  {t}: eval error {exc}", flush=True)
             continue
         sector = universe.get(t, "Unknown")
-        if s:
-            s.sector = sector
-            support.append(s)
-        if r:
-            r.sector = sector
-            resistance.append(r)
+        for hit, bucket in ((s, support), (r, resistance),
+                            (cs, confluence), (cr, confluence)):
+            if hit:
+                hit.sector = sector
+                bucket.append(hit)
 
     print(f"Support hits: {len(support)} | Resistance hits: {len(resistance)} "
-          f"(price >= ${MIN_PRICE:g})", flush=True)
+          f"| Confluence hits: {len(confluence)} (price >= ${MIN_PRICE:g})",
+          flush=True)
 
     # Fundamentals (market cap + quality grade): only fetched for stocks that
     # actually produced a hit.
-    hit_tickers = {h.ticker for h in support} | {h.ticker for h in resistance}
+    hit_tickers = {h.ticker for h in support + resistance + confluence}
     funds = fetch_fundamentals(sorted(hit_tickers))
 
     def passes_mcap(h: Hit) -> bool:
@@ -731,20 +814,21 @@ def main() -> int:
                   if funds.get(t) is None or funds[t].mcap is None)
     support = [h for h in support if passes_mcap(h)]
     resistance = [h for h in resistance if passes_mcap(h)]
+    confluence = [h for h in confluence if passes_mcap(h)]
 
-    for h in support + resistance:
+    for h in support + resistance + confluence:
         f = funds.get(h.ticker)
         if f is not None:
             h.quality, h.quality_fails, h.strong = f.quality, f.fails, f.strong
 
     # Relative strength vs SPY and sector ETFs (1M / 3M on daily closes).
-    remaining = {h.ticker for h in support} | {h.ticker for h in resistance}
+    remaining = {h.ticker for h in support + resistance + confluence}
     rs_tickers = sorted({BENCHMARK, *SECTOR_ETF.values(), *remaining})
     print(f"Downloading daily closes for relative strength "
           f"({len(rs_tickers)} tickers)...", flush=True)
     try:
         closes = download_daily_closes(rs_tickers)
-        annotate_relative_strength(support + resistance, closes)
+        annotate_relative_strength(support + resistance + confluence, closes)
     except Exception as exc:  # noqa: BLE001
         print(f"  relative-strength download failed: {exc} (legs left n/a)",
               flush=True)
@@ -756,9 +840,15 @@ def main() -> int:
           f"| {strong_ct} fundamentally strong.",
           flush=True)
 
-    html = build_email_html(support, resistance, len(data))
+    conf_sup = sorted(h.ticker for h in confluence if h.kind == "support")
+    conf_res = sorted(h.ticker for h in confluence if h.kind == "resistance")
+    print(f"Confluence (EMA cloud + AVWAP, same side): "
+          f"{len(conf_sup)} support {conf_sup or '[]'} | "
+          f"{len(conf_res)} resistance {conf_res or '[]'}", flush=True)
+
+    html = build_email_html(support, resistance, confluence, len(data))
     save_html(html)
-    send_email(html, support, resistance)
+    send_email(html, support, resistance, confluence)
     return 0
 
 
