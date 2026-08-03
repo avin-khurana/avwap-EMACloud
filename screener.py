@@ -25,6 +25,9 @@ reported in a separate section at the end. The trend-structure filter is
 NOT applied here — it requires the AVWAPs and the cloud on opposite sides
 of price and would make co-occurrence impossible; an AVWAP sitting inside
 or near the cloud is precisely what forms the confluence zone.
+Confluence hits are additionally tagged "200 SMA" (informational, not a
+gate) when the last close is also within 5% of the 200-day SMA on daily
+closes — a long-term-trend confirmation layered on top.
 
 Each hit is also graded on FUNDAMENTAL QUALITY (wheel-strategy suitability):
 net margin, return on equity, debt/equity and dividend — stocks passing the
@@ -80,7 +83,10 @@ QUALITY_MAX_DE = 200.0      # debt/equity <= 200% (yfinance reports percent)
 # DAILY closes over 1-month and 3-month lookbacks, shown for sector-vs-SPY
 # (in the sector heading), stock-vs-sector and stock-vs-SPY (per row).
 RS_LOOKBACKS = {"1M": 21, "3M": 63}   # label -> trading days
-RS_PERIOD = "4mo"                     # daily history; covers 3M with buffer
+RS_PERIOD = "1y"                      # daily history; covers 3M RS lookback
+                                       # AND the 200-day SMA confluence check
+SMA_LONG = 200                        # daily-close SMA used for confluence
+SMA_TOLERANCE = 0.05                  # 5% band for "near the 200 SMA"
 BENCHMARK = "SPY"
 SECTOR_ETF = {              # GICS sector -> SPDR sector ETF
     "Information Technology": "XLK",
@@ -208,6 +214,24 @@ def annotate_relative_strength(hits: list[Hit], closes: pd.DataFrame) -> None:
                 h.rs_stock_sector[label] = stk_ret - sec_ret
             if stk_ret is not None and spy_ret is not None:
                 h.rs_stock_spy[label] = stk_ret - spy_ret
+
+
+def annotate_sma200_confluence(hits: list[Hit], closes: pd.DataFrame) -> None:
+    """
+    Tag confluence hits whose last close sits within SMA_TOLERANCE of the
+    200-day SMA (daily closes) — an extra "long-term trend" confirmation
+    layered on top of the EMA-cloud + AVWAP confluence, not a gating rule.
+    """
+    for h in hits:
+        prices = closes.get(h.ticker)
+        if prices is None:
+            continue
+        prices = prices.dropna()
+        if len(prices) < SMA_LONG:
+            continue
+        sma200 = float(prices.tail(SMA_LONG).mean())
+        if sma200 > 0 and abs(h.price - sma200) / sma200 <= SMA_TOLERANCE:
+            h.levels.append("200 SMA")
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -640,7 +664,9 @@ def _confluence_section(confluence: list[Hit]) -> str:
                f'border-bottom:2px solid {PURPLE};padding-bottom:4px;'
                f'font-size:18px;color:{PURPLE};">&#9889; Confluence '
                f'<span style="font-size:13px;font-weight:normal;color:#666;">'
-               f'EMA cloud + AVWAP on the same side</span></h2>')
+               f'EMA cloud + AVWAP on the same side &mdash; '
+               f'"200 SMA" tag added when price is also within '
+               f'{SMA_TOLERANCE:.0%} of the 200-day SMA</span></h2>')
     if not confluence:
         return (heading
                 + '<p style="color:#888;margin-top:8px;">No confluence setups today.</p>')
@@ -829,6 +855,7 @@ def main() -> int:
     try:
         closes = download_daily_closes(rs_tickers)
         annotate_relative_strength(support + resistance + confluence, closes)
+        annotate_sma200_confluence(confluence, closes)
     except Exception as exc:  # noqa: BLE001
         print(f"  relative-strength download failed: {exc} (legs left n/a)",
               flush=True)
@@ -842,9 +869,12 @@ def main() -> int:
 
     conf_sup = sorted(h.ticker for h in confluence if h.kind == "support")
     conf_res = sorted(h.ticker for h in confluence if h.kind == "resistance")
+    sma_ct = sum(1 for h in confluence if "200 SMA" in h.levels)
     print(f"Confluence (EMA cloud + AVWAP, same side): "
           f"{len(conf_sup)} support {conf_sup or '[]'} | "
-          f"{len(conf_res)} resistance {conf_res or '[]'}", flush=True)
+          f"{len(conf_res)} resistance {conf_res or '[]'} | "
+          f"{sma_ct} also within {SMA_TOLERANCE:.0%} of the 200-day SMA",
+          flush=True)
 
     html = build_email_html(support, resistance, confluence, len(data))
     save_html(html)
